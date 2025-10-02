@@ -1,0 +1,306 @@
+---
+title: "R Lab"
+author: "Camille Medeiros"
+date: "2025-10-02"
+output: html_document
+---
+
+## Introdução
+
+Este trabalho tem como objetivo analisar o panorama do emprego formal no Brasil, utilizando microdados públicos do Cadastro Geral de Empregados e Desempregados (CAGED) e da Relação Anual de Informações Sociais (RAIS). Para contextualizar os números de emprego, os dados foram cruzados com as estimativas populacionais mais recentes do IBGE.
+
+O processo inclui a coleta, limpeza e integração de três fontes de dados distintas. Ao final, são apresentadas visualizações que exploram a distribuição do saldo de empregos por estado e a relação entre o tamanho dos estabelecimentos e a quantidade de vínculos empregatícios.
+
+```{r setup, include=FALSE}
+req_packages <- c("curl", "archive", "data.table", "dplyr", "stringr", 
+                  "fs", "ggplot2", "readxl", "janitor", "tibble", "forcats")
+new_packages <- setdiff(req_packages, rownames(installed.packages()))
+if (length(new_packages)) install.packages(new_packages, dependencies = TRUE)
+
+library(curl)
+library(archive)
+library(data.table)
+library(dplyr)
+library(stringr)
+library(fs)
+library(ggplot2)
+library(readxl)
+library(janitor)
+library(tibble)
+library(forcats)
+
+dir_create("dados_raw")
+dir_create("dados_out/RAIS_ESTAB")
+dir_create("dados_out/CAGED_202306")
+dir_create("graficos")
+
+peek_names <- function(path) {
+  fread(path, nrows = 0, sep = ";", encoding = "Latin-1") |> names()
+}
+```
+
+## Tratamento Reprodutível: Coleta e Limpeza
+
+Nesta seção, realizamos o download, a extração e a limpeza dos dados. O processo foi desenhado para ser totalmente reprodutível.
+
+### Download e Extração dos Dados
+
+Os dados são baixados de fontes oficiais do governo. Uma função auxiliar verifica se o arquivo já existe para evitar downloads repetidos.
+
+```{r data-download-extraction, message=FALSE, results='hide'}
+ftp_base <- "ftp://ftp.mtps.gov.br/pdet/microdados/"
+url_rais_estab <- paste0(ftp_base, "RAIS/2023/RAIS_ESTAB_PUB.7z")
+url_caged_mov_202306 <- paste0(ftp_base, "NOVO%20CAGED/2023/202306/CAGEDMOV202306.7z")
+dest_pop <- "dados_raw/POP2024_20241101.xls"
+
+dl_if_missing <- function(url, dest) {
+  if (!file.exists(dest)) {
+    tryCatch(
+      {
+        curl_download(url, destfile = dest, mode = "wb")
+      },
+      error = function(e) {
+        message(paste("Falha no download de:", url, ". Por favor, baixe manualmente e coloque em:", dest))
+      }
+    )
+  }
+}
+
+dl_if_missing(url_rais_estab, "dados_raw/RAIS_ESTAB_PUB.7z")
+dl_if_missing(url_caged_mov_202306, "dados_raw/CAGEDMOV202306.7z")
+
+extract_some <- function(zip_path, out_dir, pattern = "\\.txt$") {
+  idx <- grepl(pattern, archive(zip_path)$path, ignore.case = TRUE)
+  paths <- archive(zip_path)$path[idx]
+  archive_extract(zip_path, file = paths, dir = out_dir)
+  file.path(out_dir, basename(paths))
+}
+
+txt_rais_estab <- extract_some("dados_raw/RAIS_ESTAB_PUB.7z", "dados_out/RAIS_ESTAB")
+txt_caged <- extract_some("dados_raw/CAGEDMOV202306.7z", "dados_out/CAGED_202306")
+
+arq_estab <- txt_rais_estab[which.max(file.size(txt_rais_estab))]
+arq_caged <- txt_caged[which.max(file.size(txt_caged))]
+```
+
+### Leitura e Limpeza dos Dados
+
+Após a extração, os arquivos são lidos, e uma limpeza inicial é realizada. Isso inclui a seleção de colunas relevantes, a padronização dos nomes das colunas e a correção de codificação de caracteres.
+
+#### CAGED - Saldo de Empregos
+
+```{r caged-cleaning, message=FALSE}
+caged_jun <- fread(arq_caged, sep = ";", encoding = "UTF-8") %>%
+  as_tibble() %>%
+  clean_names() %>%
+  select(
+    uf,
+    municipio,
+    saldomovimentacao,
+    sexo,
+    competenciamov
+  )
+
+cat("Estrutura do Data Frame CAGED após a correção:\n")
+glimpse(caged_jun)
+
+caged_jun_rj <- caged_jun %>%
+  filter(uf == "33", municipio != 999999)
+```
+
+
+#### RAIS - Estabelecimentos
+
+```{r rais-cleaning}
+nm_estab <- peek_names(arq_estab)
+
+sel_estab <- intersect(c("UF", "Município", "Tamanho Estabelecimento", "Qtd Vínculos Ativos"), nm_estab)
+
+rais_estab <- fread(arq_estab, sep = ";", encoding = "Latin-1", select = sel_estab) %>%
+  as_tibble() %>%
+  clean_names()
+
+rais_estab_ro <- rais_estab %>% 
+  filter(uf == 11)
+
+glimpse(rais_estab_ro)
+```
+
+#### IBGE - Estimativa Populacional
+
+```{r population-cleaning}
+header_probe <- read_excel(dest_pop, sheet = "MUNICÍPIOS", col_names = FALSE, n_max = 10)
+header_row <- which(apply(header_probe, 1, function(r) any(grepl("^UF$", as.character(r), ignore.case = TRUE))))[1]
+
+pop_raw <- read_excel(dest_pop, sheet = "MUNICÍPIOS", skip = header_row - 1) %>%
+  clean_names()
+
+populacao <- pop_raw %>%
+  transmute(
+    uf = as.character(uf),
+    cod_uf = as.numeric(cod_uf),
+    cod_mun = as.numeric(cod_munic),
+    municipio_nome = as.character(nome_do_municipio),
+    populacao_estimada = as.numeric(populacao_estimada)
+  ) %>%
+  mutate(
+    municipio = as.numeric(paste0(cod_uf, sprintf("%05d", cod_mun))),
+    municipio_6dig = as.numeric(substr(as.character(municipio), 1, 6))
+  ) %>%
+  filter(!is.na(municipio), !is.na(populacao_estimada))
+
+glimpse(populacao)
+```
+
+### Integração dos Dados (Join)
+
+Para enriquecer a análise, integramos a base do CAGED (saldo de empregos) com a base de população. Usamos um `left_join` para adicionar a população estimada a cada município na base do CAGED.
+
+```{r data-integration}
+caged_agg <- caged_jun %>%
+  group_by(uf, municipio) %>%
+  summarise(saldo_total = sum(saldomovimentacao, na.rm = TRUE), .groups = 'drop') %>%
+  rename(municipio_6dig = municipio)
+
+dados_integrados <- caged_agg %>%
+  left_join(populacao, by = "municipio_6dig") %>%
+  filter(!is.na(populacao_estimada), municipio_6dig != 999999) %>% 
+  rename(uf_cod = uf.x, uf_sigla = uf.y)
+
+glimpse(dados_integrados)
+```
+
+## Análise Gráfica e Interpretação
+
+Com os dados tratados e integrados, podemos criar visualizações para extrair insights.
+
+### Gráfico 1: Saldo de Empregos por Estado (UF)
+
+O primeiro gráfico que você tinha mostrava o saldo de empregos absoluto, o que naturalmente favorece estados mais populosos como São Paulo. Este novo gráfico corrige essa distorção, mostrando o saldo de vagas para cada 10.000 habitantes. Isso nos diz quais estados foram mais eficientes em gerar empregos, proporcionalmente ao seu tamanho
+
+```{r plot-saldo-uf, fig.width=10, fig.height=8}
+saldo_relativo_uf <- dados_integrados %>%
+  group_by(uf_sigla) %>%
+  summarise(
+    saldo_total = sum(saldo_total, na.rm = TRUE),
+    pop_total = sum(populacao_estimada, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    saldo_por_10k_hab = (saldo_total / pop_total) * 10000
+  ) %>%
+  filter(!is.na(uf_sigla))
+
+ggplot(saldo_relativo_uf, aes(x = fct_reorder(uf_sigla, saldo_por_10k_hab), y = saldo_por_10k_hab, fill = saldo_por_10k_hab > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = c("firebrick", "steelblue")) +
+  labs(
+    title = "Saldo de Empregos por 10 mil Habitantes - Junho/2023",
+    subtitle = "Indicador mede a eficiência na geração de vagas por estado",
+    x = "Estado (UF)",
+    y = "Saldo de Vagas para cada 10.000 Habitantes"
+  ) +
+  theme_minimal() +
+  geom_text(
+    aes(label = round(saldo_por_10k_hab, 1)), 
+    hjust = ifelse(saldo_relativo_uf$saldo_por_10k_hab > 0, -0.2, 1.2), 
+    size = 3.5
+  )
+
+ggsave("graficos/saldo_relativo_uf.png", width = 10, height = 8)
+```
+
+Este gráfico ajusta a performance de geração de empregos pelo tamanho da população, oferecendo uma visão muito mais precisa do dinamismo econômico de cada estado.
+
+O grande destaque é o estado do Mato Grosso (MT), uma surpresa, que lidera com uma performance de 27,9 novas vagas para cada 10.000 habitantes, mais que o dobro do segundo colocado. Este resultado é um forte indicativo da força do agronegócio, que provavelmente vivia um período de alta atividade, impulsionando a contratação em toda a sua cadeia produtiva.
+
+Em seguida, vemos outros estados com desempenho próximo, como Piauí (PI), Minas Gerais (MG) e Rondônia (RO). A presença de estados de diferentes regiões neste grupo sugere que o crescimento não esteve concentrado apenas nos polos econômicos tradicionais.
+
+Estados muito populosos como São Paulo (SP) e Rio de Janeiro (RJ), embora gerem um volume altíssimo de vagas, apresentam um desempenho relativo mais modesto (7,9 e 7,8 vagas por 10 mil habitantes, respectivamente). Isso demonstra que, apesar de sua importância, o ritmo de crescimento de suas economias, quando ajustado pela população, é superado pelo de outros estados mais dinâmicos.
+
+Na outra ponta, o gráfico acende um alerta para Rio Grande do Sul (RS), Paraíba (PB) e, principalmente, Roraima (RR), que apresentaram um saldo negativo de empregos. Isso indica uma retração na economia formal desses estados no período, com mais demissões do que contratações, sinalizando possíveis desafios em seus principais setores econômicos.
+
+### Gráfico 2: "Campeões e Lanternas" - Os 15 Municípios com Melhor e Pior Desempenho
+Vamos descer ao nível municipal para ver quais cidades estão realmente se destacando. Este gráfico mostra os 15 municípios (com mais de 20 mil habitantes) com o maior e o menor saldo de empregos por 10.000 habitantes no Brasil.
+
+```{r plot-vinculos-tamanho, fig.width=10, fig.height=6}
+desempenho_municipios <- dados_integrados %>%
+  filter(populacao_estimada > 20000) %>%
+  mutate(
+    saldo_por_10k_hab = (saldo_total / populacao_estimada) * 10000,
+    municipio_uf = paste(municipio_nome, "-", uf_sigla)
+  ) %>%
+  arrange(desc(saldo_por_10k_hab))
+
+top_bottom_15 <- bind_rows(
+  slice_max(desempenho_municipios, order_by = saldo_por_10k_hab, n = 15),
+  slice_min(desempenho_municipios, order_by = saldo_por_10k_hab, n = 15)
+) %>%
+  mutate(
+    tipo = ifelse(saldo_por_10k_hab > 0, "Top 15 Melhores", "Top 15 Piores"),
+    municipio_uf = fct_reorder(municipio_uf, saldo_por_10k_hab)
+  )
+
+ggplot(top_bottom_15, aes(x = municipio_uf, y = saldo_por_10k_hab, fill = tipo)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ tipo, scales = "free_y") +
+  labs(
+    title = "Os 15 Municípios com Melhor e Pior Desempenho na Geração de Empregos",
+    subtitle = "Saldo de vagas por 10 mil habitantes em cidades com mais de 20 mil pessoas (Junho/2023)",
+    x = "Município",
+    y = "Saldo de Vagas para cada 10.000 Habitantes"
+  ) +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold", size = 12))
+
+ggsave("graficos/top_bottom_municipios.png", width = 12, height = 10, dpi = 300)
+```
+
+
+No painel dos "Top 15 Melhores", observa-se uma clara predominância de municípios ligados ao agronegócio e à agroindústria. Cidades como Aldeias Altas (MA), Matão (SP), Sapezal (MT) e Cristalina (GO) são conhecidas por sua forte produção agrícola ou industrial (processamento de alimentos, suco, etc.), o que reforça a conclusão de que este setor foi o grande propulsor de empregos no período. A presença de Barueri (SP), um conhecido polo de serviços e tecnologia, mostra que este setor também contribui, mas a força do interior do país é o destaque.
+
+O painel dos "Top 15 Piores" conta uma história igualmente concentrada. Há uma notável concentração de municípios do Rio Grande do Sul (Teutônia, Santa Cruz do Sul, São José do Norte, etc.) e do Espírito Santo (Rio Bananal, Jaguaré, Sooretama). Essa concentração regional sugere fortemente a ocorrência de problemas setoriais ou sazonais. Cidades gaúchas, por exemplo, podem ter sofrido com o fim de ciclos de colheita ou com dificuldades em setores específicos como o calçadista ou moveleiro. Da mesma forma, as cidades capixabas, fortes no cultivo de café e frutas, poderiam estar em um período de entressafra.
+
+## Gráfico 3: Relação entre População e Saldo de Empregos
+
+Será que cidades maiores sempre geram mais empregos? Este gráfico de dispersão (scatter plot) explora a relação entre o tamanho da população de um município e seu saldo de vagas, permitindo identificar tendências e outliers.
+
+```{r}
+ggplot(dados_integrados, aes(x = populacao_estimada, y = saldo_total)) +
+  geom_point(aes(color = uf_sigla), alpha = 0.5, show.legend = FALSE) +
+  scale_x_log10(
+    labels = scales::label_number(big.mark = ".", decimal.mark = ","),
+    breaks = c(10000, 50000, 100000, 500000, 1000000, 5000000, 12000000)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linetype = "dotted") +
+  labs(
+    title = "Relação entre População do Município e Geração de Vagas",
+    subtitle = "Cada ponto é um município brasileiro. Eixo X em escala logarítmica.",
+    x = "População Estimada (log)",
+    y = "Saldo Total de Vagas"
+  ) +
+  theme_light()
+
+ggsave("graficos/populacao_vs_saldo.png", width = 11, height = 7, dpi = 300)
+```
+Este gráfico de dispersão explora se existe uma relação direta entre o tamanho de uma cidade e sua capacidade de gerar empregos. Cada ponto representa um município brasileiro.
+
+A linha pontilhada preta (linha de tendência) mostra uma clara inclinação positiva. Isso confirma a teoria econômica de que, em média, quanto maior a população de um município, maior tende a ser seu saldo absoluto de vagas. Cidades maiores possuem economias mais diversificadas e geram mais oportunidades.
+
+A observação mais interessante é a dispersão dos pontos. Na esquerda (cidades menores), os pontos estão muito concentrados perto do zero. Na direita (cidades maiores), os pontos se espalham mais, tanto para cima quanto para baixo. Isso significa que o risco e o potencial de retorno são muito maiores nas grandes metrópoles. Uma cidade pequena dificilmente criará ou perderá milhares de empregos em um mês, mas uma capital como São Paulo (o ponto no extremo direito, bem acima) tem potencial para ambos os extremos.
+
+Em conclusão, o gráfico demonstra que, embora a população seja um fator importante, a performance econômica de um município é altamente variável e depende de fatores locais específicos. Os pontos muito acima da linha de tendência são os "campeões" que vimos no Gráfico 2 – cidades que superaram em muito o esperado para seu tamanho.
+
+## Glossário de Variáveis
+
+* **uf:** Sigla da Unidade da Federação.
+* **municipio:** Código do município conforme o padrão IBGE (7 dígitos).
+* **saldomovimentacao:** Saldo de empregos formais, calculado como o total de admissões menos o total de desligamentos em um determinado período. Um valor de `1` representa uma admissão e `-1` um desligamento.
+* **competenciamov:** Mês e ano de referência da movimentação no CAGED, no formato `YYYYMM`.
+* **populacao_estimada:** População residente estimada para o município, segundo o IBGE.
+* **qtd_vinculos_ativos:** Número total de empregos formais (vínculos) ativos em um estabelecimento em 31/12 do ano de referência da RAIS.
+* **tamanho_estabelecimento:** Categoria que classifica o estabelecimento com base no número de funcionários.
+
